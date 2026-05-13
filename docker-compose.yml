@@ -9,4 +9,9 @@ services:
       - ./data:/app/data
     environment:
       - CONFIG_PATH=/app/data/config.json
+      # - ADMIN_PASSWORD=changeme        # 管理面板密码
+      # - PORT=8080                      # 监听端口（Zeabur 等平台自动分配）
+      # - HOST=0.0.0.0                   # 监听地址
+      # - API_KEY=your-api-key           # API 鉴权密钥
+      # - REQUIRE_API_KEY=true           # 是否强制 API 鉴权（设 API_KEY 后默认 true）
     restart: unless-stopped

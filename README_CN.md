@@ -87,6 +87,24 @@ curl http://localhost:8080/v1/chat/completions \
 |-----|------|-------|
 | `CONFIG_PATH` | 配置文件路径 | `data/config.json` |
 | `ADMIN_PASSWORD` | 管理面板密码（覆盖配置文件） | - |
+| `PORT` | HTTP 监听端口（Zeabur 等平台通过此变量分配端口） | `8080` |
+| `HOST` | HTTP 监听地址 | `0.0.0.0` |
+| `API_KEY` | API 鉴权密钥，设置后客户端需在请求中携带此 key | - |
+| `REQUIRE_API_KEY` | 是否强制 API 鉴权（`true`/`false`），需配合有效 `API_KEY` 或配置文件中的 `apiKey` 使用；设了 `API_KEY` 后默认为 `true` | `false` |
+
+## Zeabur / 容器部署
+
+在 Zeabur 等 PaaS 平台部署时，平台会自动注入 `PORT` 环境变量来指定监听端口，Kiro-Go 会自动读取并使用。无需修改 Dockerfile 或手动配置端口。
+
+部署步骤：
+
+1. 在 Zeabur 中创建服务，选择从 Git 仓库部署
+2. 在「环境变量」中按需设置：
+   - `ADMIN_PASSWORD` — 管理面板密码（**强烈建议设置**）
+   - `API_KEY` — 如需 API 鉴权，设置一个安全的密钥
+   - `REQUIRE_API_KEY=true` — 如需强制鉴权（设了 `API_KEY` 后默认启用）
+3. 确保 `/app/data` 目录使用持久化存储卷，以保存配置和账号数据
+4. 部署完成后，通过平台分配的域名访问 `/admin` 管理面板
 
 ## 参与贡献
 

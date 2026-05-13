@@ -87,6 +87,24 @@ The setting takes effect immediately without restarting.
 |----------|-------------|---------|
 | `CONFIG_PATH` | Config file path | `data/config.json` |
 | `ADMIN_PASSWORD` | Admin panel password (overrides config) | - |
+| `PORT` | HTTP listening port (auto-injected by Zeabur and similar platforms) | `8080` |
+| `HOST` | HTTP bind address | `0.0.0.0` |
+| `API_KEY` | API authentication key; clients must include this key in requests | - |
+| `REQUIRE_API_KEY` | Enforce API key validation (`true`/`false`); requires a valid `API_KEY` or `apiKey` in the config file; defaults to `true` when `API_KEY` is set | `false` |
+
+## Zeabur / Container Deployment
+
+On Zeabur and similar PaaS platforms, the `PORT` environment variable is automatically injected to specify the listening port. Kiro-Go reads it automatically — no Dockerfile changes or manual port configuration needed.
+
+Deployment steps:
+
+1. Create a service on Zeabur and deploy from your Git repository
+2. Set environment variables as needed under **Variables**:
+   - `ADMIN_PASSWORD` — Admin panel password (**strongly recommended**)
+   - `API_KEY` — A secure key if API authentication is desired
+   - `REQUIRE_API_KEY=true` — Enforce authentication (enabled by default when `API_KEY` is set)
+3. Ensure `/app/data` uses a persistent storage volume to preserve config and account data
+4. Once deployed, access `/admin` via the platform-assigned domain
 
 ## Contributing
 

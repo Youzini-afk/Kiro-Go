@@ -215,6 +215,31 @@ func SetPassword(password string) {
 	cfg.Password = password
 }
 
+// SetPort updates the server listening port.
+// Primarily used for PORT environment variable override in containerized deployments (e.g. Zeabur).
+func SetPort(port int) {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.Port = port
+}
+
+// SetHost updates the server bind address.
+// Primarily used for HOST environment variable override in containerized deployments.
+func SetHost(host string) {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.Host = host
+}
+
+// SetApiKey updates the API key and whether it is required.
+// Primarily used for API_KEY / REQUIRE_API_KEY environment variable override in containerized deployments.
+func SetApiKey(apiKey string, requireApiKey bool) {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.ApiKey = apiKey
+	cfg.RequireApiKey = requireApiKey
+}
+
 func Get() *Config {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
@@ -240,7 +265,7 @@ func GetHost() string {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
 	if cfg.Host == "" {
-		return "127.0.0.1"
+		return "0.0.0.0"
 	}
 	return cfg.Host
 }
