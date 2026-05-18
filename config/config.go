@@ -52,8 +52,15 @@ type Account struct {
 	MachineId    string `json:"machineId,omitempty"`    // UUID machine identifier for request tracking
 	ProfileArn   string `json:"profileArn,omitempty"`   // CodeWhisperer/Kiro profile ARN for generation requests
 
+	// Per-account outbound proxy (falls back to global ProxyURL if empty)
+	ProxyURL string `json:"proxyURL,omitempty"`
+
 	// Priority weight for load balancing (higher = more requests)
 	Weight int `json:"weight,omitempty"` // 0 or 1 = normal, 2+ = higher priority
+
+	// Overage behavior after the main usage limit is reached.
+	AllowOverage  bool `json:"allowOverage,omitempty"`  // Whether to keep using the account after UsageLimit is reached
+	OverageWeight int  `json:"overageWeight,omitempty"` // 1-10, lower values reduce overage request frequency
 
 	// Account status
 	Enabled   bool   `json:"enabled"`             // Whether account is active in the pool
@@ -88,6 +95,18 @@ type Account struct {
 	TotalCredits float64 `json:"totalCredits,omitempty"` // Cumulative credits consumed
 }
 
+// PromptFilterRule defines a single custom prompt sanitization rule.
+// Type can be: "regex" (regexp find/replace within prompt) or
+// "lines-containing" (remove lines containing the match substring).
+type PromptFilterRule struct {
+	ID      string `json:"id"`                // Unique rule identifier
+	Name    string `json:"name"`              // Human-readable rule name
+	Type    string `json:"type"`              // "regex" or "lines-containing"
+	Match   string `json:"match"`             // Pattern to match (regex pattern or substring)
+	Replace string `json:"replace,omitempty"` // Replacement string (only for regex; empty = delete match)
+	Enabled bool   `json:"enabled"`           // Whether this rule is active
+}
+
 // Config represents the global application configuration.
 type Config struct {
 	// Server settings
@@ -113,11 +132,34 @@ type Config struct {
 	// Defaults to true. Set to false to only use the preferred endpoint.
 	EndpointFallback *bool `json:"endpointFallback,omitempty"`
 
+	// AllowOverUsage allows accounts to continue serving requests even when their
+	// usage quota has been exhausted. When enabled, the pool will not skip accounts
+	// solely because usageCurrent >= usageLimit.
+	AllowOverUsage bool `json:"allowOverUsage,omitempty"`
+
 	// Proxy configuration: optional outbound proxy for Kiro API requests
 	// Format: "socks5://host:port", "socks5://user:pass@host:port",
 	//         "http://host:port",  "http://user:pass@host:port"
 	// Leave empty to connect directly.
 	ProxyURL string `json:"proxyURL,omitempty"`
+
+	// SanitizeClaudeCodePrompt is kept for backward-compatible JSON loading only.
+	// Migrated to FilterClaudeCode on first load. Do not use directly.
+	SanitizeClaudeCodePrompt bool `json:"sanitizeClaudeCodePrompt,omitempty"`
+
+	// FilterClaudeCode detects the Claude Code CLI built-in system prompt and replaces it
+	// with a compact backend-only prompt, reducing token usage significantly.
+	FilterClaudeCode bool `json:"filterClaudeCode,omitempty"`
+
+	// FilterEnvNoise strips environment metadata lines from system prompts:
+	// git status, recent commits, environment sections, fast_mode_info tags, etc.
+	FilterEnvNoise bool `json:"filterEnvNoise,omitempty"`
+
+	// FilterStripBoundaries removes --- SYSTEM PROMPT --- / --- END SYSTEM PROMPT --- markers.
+	FilterStripBoundaries bool `json:"filterStripBoundaries,omitempty"`
+
+	// PromptFilterRules is a list of user-defined prompt sanitization rules (regex or line-filter).
+	PromptFilterRules []PromptFilterRule `json:"promptFilterRules,omitempty"`
 
 	// LogLevel controls verbosity of application logs.
 	// Accepted values: "debug", "info", "warn", "error". Defaults to "info".
@@ -153,7 +195,7 @@ type AccountInfo struct {
 }
 
 // Version current version
-const Version = "1.0.7"
+const Version = "1.0.8"
 
 var (
 	cfg     *Config
@@ -309,6 +351,19 @@ func UpdateAccount(id string, account Account) error {
 	return nil
 }
 
+// DisableAccountOverage turns off AllowOverage for a specific account.
+func DisableAccountOverage(id string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i, a := range cfg.Accounts {
+		if a.ID == id {
+			cfg.Accounts[i].AllowOverage = false
+			return Save()
+		}
+	}
+	return nil
+}
+
 func UpdateAccountProfileArn(id, profileArn string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
@@ -437,6 +492,89 @@ func UpdateAccountInfo(id string, info AccountInfo) error {
 	return nil
 }
 
+// GetFilterClaudeCode returns whether Claude Code system prompt detection is enabled.
+// Also checks the legacy SanitizeClaudeCodePrompt flag for backward compatibility.
+func GetFilterClaudeCode() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return false
+	}
+	return cfg.FilterClaudeCode || cfg.SanitizeClaudeCodePrompt
+}
+
+// GetFilterEnvNoise returns whether environment noise line stripping is enabled.
+func GetFilterEnvNoise() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return false
+	}
+	return cfg.FilterEnvNoise
+}
+
+// GetFilterStripBoundaries returns whether boundary marker stripping is enabled.
+func GetFilterStripBoundaries() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return false
+	}
+	return cfg.FilterStripBoundaries
+}
+
+// PromptFilterConfig holds all prompt filter settings for API responses.
+type PromptFilterConfig struct {
+	FilterClaudeCode      bool               `json:"filterClaudeCode"`
+	FilterEnvNoise        bool               `json:"filterEnvNoise"`
+	FilterStripBoundaries bool               `json:"filterStripBoundaries"`
+	Rules                 []PromptFilterRule `json:"rules"`
+}
+
+// GetPromptFilterConfig returns all prompt filter settings.
+func GetPromptFilterConfig() PromptFilterConfig {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return PromptFilterConfig{Rules: []PromptFilterRule{}}
+	}
+	rules := make([]PromptFilterRule, len(cfg.PromptFilterRules))
+	copy(rules, cfg.PromptFilterRules)
+	return PromptFilterConfig{
+		FilterClaudeCode:      cfg.FilterClaudeCode || cfg.SanitizeClaudeCodePrompt,
+		FilterEnvNoise:        cfg.FilterEnvNoise,
+		FilterStripBoundaries: cfg.FilterStripBoundaries,
+		Rules:                 rules,
+	}
+}
+
+// UpdatePromptFilterConfig saves all prompt filter settings atomically.
+func UpdatePromptFilterConfig(filterClaudeCode, filterEnvNoise, filterStripBoundaries bool, rules []PromptFilterRule) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.FilterClaudeCode = filterClaudeCode
+	cfg.FilterEnvNoise = filterEnvNoise
+	cfg.FilterStripBoundaries = filterStripBoundaries
+	// Clear legacy flag to avoid double-applying after first save
+	cfg.SanitizeClaudeCodePrompt = false
+	if rules != nil {
+		cfg.PromptFilterRules = rules
+	}
+	return Save()
+}
+
+// GetPromptFilterRules returns the current prompt filter rules.
+func GetPromptFilterRules() []PromptFilterRule {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return nil
+	}
+	rules := make([]PromptFilterRule, len(cfg.PromptFilterRules))
+	copy(rules, cfg.PromptFilterRules)
+	return rules
+}
+
 // ThinkingConfig holds settings for AI thinking/reasoning mode.
 // When enabled, models output their reasoning process alongside the response.
 type ThinkingConfig struct {
@@ -528,6 +666,24 @@ func UpdateProxySettings(proxyURL string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.ProxyURL = proxyURL
+	return Save()
+}
+
+// GetAllowOverUsage returns whether over-usage is allowed when account quota is exhausted.
+func GetAllowOverUsage() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return false
+	}
+	return cfg.AllowOverUsage
+}
+
+// UpdateAllowOverUsage sets the over-usage setting and persists the change.
+func UpdateAllowOverUsage(allow bool) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.AllowOverUsage = allow
 	return Save()
 }
 
