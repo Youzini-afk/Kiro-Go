@@ -5,10 +5,12 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"kiro-go/config"
 	"kiro-go/logger"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -53,6 +55,8 @@ var kiroEndpoints = []kiroEndpoint{
 var kiroHttpStore atomic.Pointer[http.Client]
 var kiroRestHttpStore atomic.Pointer[http.Client]
 
+const kiroStreamingTimeout = 8 * time.Minute
+
 // proxyClientCache caches http.Client instances keyed by proxy URL for per-account proxy support.
 var proxyClientCache sync.Map
 
@@ -62,6 +66,8 @@ func init() {
 
 // GetClientForProxy returns an http.Client configured for the given proxy URL.
 // If proxyURL is empty, returns the global kiro HTTP client.
+// Streaming clients use a long absolute timeout to avoid premature truncation
+// while still bounding stuck requests.
 func GetClientForProxy(proxyURL string) *http.Client {
 	if proxyURL == "" {
 		return kiroHttpStore.Load()
@@ -70,7 +76,7 @@ func GetClientForProxy(proxyURL string) *http.Client {
 		return cached.(*http.Client)
 	}
 	client := &http.Client{
-		Timeout:   5 * time.Minute,
+		Timeout:   kiroStreamingTimeout,
 		Transport: buildKiroTransport(proxyURL),
 	}
 	proxyClientCache.Store(proxyURL, client)
@@ -110,8 +116,15 @@ func buildKiroTransport(proxyURL string) *http.Transport {
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 20,
 		IdleConnTimeout:     90 * time.Second,
-		DisableCompression:  false,
-		ForceAttemptHTTP2:   true,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 60 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		DisableCompression:    false,
+		ForceAttemptHTTP2:     true,
 	}
 	if proxyURL != "" {
 		if u, err := url.Parse(proxyURL); err == nil {
@@ -126,9 +139,12 @@ func buildKiroTransport(proxyURL string) *http.Transport {
 }
 
 // InitKiroHttpClient initializes (or reinitializes) the HTTP clients used for Kiro API requests.
+// Streaming client uses a long absolute timeout to avoid premature truncation
+// while still bounding stuck requests.
+// REST client keeps 30s timeout for non-streaming requests.
 func InitKiroHttpClient(proxyURL string) {
 	client := &http.Client{
-		Timeout:   5 * time.Minute,
+		Timeout:   kiroStreamingTimeout,
 		Transport: buildKiroTransport(proxyURL),
 	}
 	kiroHttpStore.Store(client)
@@ -421,8 +437,30 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 			continue
 		}
 
-		eventType := extractEventType(msgBuf[0:headersLength])
+		hdrs := extractEventStreamHeaders(msgBuf[0:headersLength])
 		payloadBytes := msgBuf[headersLength : len(msgBuf)-4]
+
+		// Check for exception/error frames before JSON unmarshal.
+		// These must not be silently swallowed.
+		if hdrs.MessageType == "exception" || hdrs.MessageType == "error" {
+			errMsg := fmt.Sprintf("event stream %s", hdrs.MessageType)
+			if hdrs.ExceptionType != "" {
+				errMsg = fmt.Sprintf("%s: %s", errMsg, hdrs.ExceptionType)
+			} else if hdrs.ErrorCode != "" {
+				errMsg = fmt.Sprintf("%s: %s", errMsg, hdrs.ErrorCode)
+			}
+			// Try to extract message from payload for more context.
+			var payload map[string]interface{}
+			if len(payloadBytes) > 0 && json.Unmarshal(payloadBytes, &payload) == nil {
+				if msg, ok := payload["message"].(string); ok && msg != "" {
+					errMsg = fmt.Sprintf("%s: %s", errMsg, msg)
+				} else if msg, ok := payload["Message"].(string); ok && msg != "" {
+					errMsg = fmt.Sprintf("%s: %s", errMsg, msg)
+				}
+			}
+			return errors.New(errMsg)
+		}
+
 		if len(payloadBytes) == 0 {
 			continue
 		}
@@ -435,7 +473,7 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 		inputTokens, outputTokens = updateTokensFromEvent(event, inputTokens, outputTokens)
 
 		// Dispatch by event type.
-		switch eventType {
+		switch hdrs.EventType {
 		case "assistantResponseEvent":
 			if content, ok := event["content"].(string); ok && content != "" {
 				normalized := normalizeChunk(content, &lastAssistantContent)
@@ -685,8 +723,17 @@ func finishToolUse(state *toolUseState, callback *KiroStreamCallback) {
 	})
 }
 
-// extractEventType extracts the event type string from AWS Event Stream message headers.
-func extractEventType(headers []byte) string {
+// eventStreamHeaders holds parsed AWS Event Stream message header values.
+type eventStreamHeaders struct {
+	EventType     string // :event-type
+	MessageType   string // :message-type
+	ExceptionType string // :exception-type
+	ErrorCode     string // :error-code
+}
+
+// extractEventStreamHeaders extracts all relevant headers from AWS Event Stream message headers.
+func extractEventStreamHeaders(headers []byte) eventStreamHeaders {
+	var result eventStreamHeaders
 	offset := 0
 	for offset < len(headers) {
 		if offset >= len(headers) {
@@ -716,8 +763,15 @@ func extractEventType(headers []byte) string {
 			}
 			value := string(headers[offset : offset+valueLen])
 			offset += valueLen
-			if name == ":event-type" {
-				return value
+			switch name {
+			case ":event-type":
+				result.EventType = value
+			case ":message-type":
+				result.MessageType = value
+			case ":exception-type":
+				result.ExceptionType = value
+			case ":error-code":
+				result.ErrorCode = value
 			}
 			continue
 		}
@@ -736,5 +790,11 @@ func extractEventType(headers []byte) string {
 			break
 		}
 	}
-	return ""
+	return result
+}
+
+// extractEventType extracts the event type string from AWS Event Stream message headers.
+// Kept for backward compatibility; delegates to extractEventStreamHeaders.
+func extractEventType(headers []byte) string {
+	return extractEventStreamHeaders(headers).EventType
 }

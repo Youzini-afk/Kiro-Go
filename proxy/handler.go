@@ -1790,6 +1790,16 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 		h.recordFailure()
 		h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429"))
 		h.checkOverageError(err, account.ID)
+		// Write an OpenAI-style error SSE chunk so the client is informed.
+		errChunk := map[string]interface{}{
+			"error": map[string]interface{}{
+				"type":    "server_error",
+				"message": err.Error(),
+			},
+		}
+		errData, _ := json.Marshal(errChunk)
+		fmt.Fprintf(w, "data: %s\n\n", string(errData))
+		flusher.Flush()
 		return
 	}
 
