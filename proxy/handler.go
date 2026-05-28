@@ -480,6 +480,7 @@ func buildAnthropicModelsResponse(cached []ModelInfo, thinkingSuffix string) []m
 		return nil
 	}
 
+	cached = appendExperimentalModels(cached)
 	models := make([]map[string]interface{}, 0, len(cached)*2)
 	if len(cached) > 0 {
 		for _, m := range cached {
@@ -578,6 +579,7 @@ func (h *Handler) refreshModelsCache() {
 			h.handleAccountFailure(account, err)
 			continue
 		}
+		models = appendExperimentalModels(models)
 		// 缓存每账号可用模型，用于路由时过滤
 		modelIDs := make([]string, 0, len(models))
 		for _, m := range models {
@@ -606,6 +608,7 @@ func (h *Handler) fetchAndCacheAccountModels(account *config.Account) error {
 	if err != nil {
 		return err
 	}
+	models = appendExperimentalModels(models)
 	modelIDs := make([]string, 0, len(models))
 	for _, m := range models {
 		modelIDs = append(modelIDs, m.ModelId)
@@ -696,6 +699,14 @@ func mergeUniqueModels(existing []ModelInfo, incoming []ModelInfo) []ModelInfo {
 	}
 
 	return merged
+}
+
+func appendExperimentalModels(models []ModelInfo) []ModelInfo {
+	return mergeUniqueModels(models, []ModelInfo{{
+		ModelId:    "claude-opus-4.8",
+		ModelName:  "Claude Opus 4.8 (experimental)",
+		InputTypes: []string{"text", "image"},
+	}})
 }
 
 func mergeModelInfo(base ModelInfo, extra ModelInfo) ModelInfo {

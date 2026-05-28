@@ -467,8 +467,8 @@ func TestBuildAnthropicModelsResponseGeneratesThinkingVariants(t *testing.T) {
 		InputTypes: []string{"text", "image"},
 	}}, "-thinking")
 
-	if len(models) != 2 {
-		t.Fatalf("expected base model and thinking variant, got %d", len(models))
+	if len(models) != 4 {
+		t.Fatalf("expected base, experimental model, and thinking variants, got %d", len(models))
 	}
 	if models[0]["id"] != "claude-sonnet-4.5" {
 		t.Fatalf("unexpected base model id: %#v", models[0]["id"])
@@ -478,6 +478,45 @@ func TestBuildAnthropicModelsResponseGeneratesThinkingVariants(t *testing.T) {
 	}
 	if supportsImage, ok := models[0]["supports_image"].(bool); !ok || !supportsImage {
 		t.Fatalf("expected image capability to be preserved, got %#v", models[0]["supports_image"])
+	}
+}
+
+func TestBuildAnthropicModelsResponseAppendsExperimentalOpus48(t *testing.T) {
+	models := buildAnthropicModelsResponse([]ModelInfo{{
+		ModelId:    "claude-sonnet-4.6",
+		InputTypes: []string{"text"},
+	}}, "-thinking")
+	ids := make(map[string]bool, len(models))
+	for _, model := range models {
+		id, _ := model["id"].(string)
+		ids[id] = true
+	}
+
+	if !ids["claude-opus-4.8"] {
+		t.Fatalf("expected cached model response to include experimental claude-opus-4.8")
+	}
+	if !ids["claude-opus-4.8-thinking"] {
+		t.Fatalf("expected cached model response to include experimental thinking variant")
+	}
+}
+
+func TestAppendExperimentalModelsDoesNotDuplicateOpus48(t *testing.T) {
+	models := appendExperimentalModels([]ModelInfo{{
+		ModelId:    "claude-opus-4.8",
+		InputTypes: []string{"text"},
+	}})
+
+	count := 0
+	for _, model := range models {
+		if model.ModelId == "claude-opus-4.8" {
+			count++
+			if !modelSupportsImage(model.InputTypes) {
+				t.Fatalf("expected merged experimental model to preserve image support, got %#v", model.InputTypes)
+			}
+		}
+	}
+	if count != 1 {
+		t.Fatalf("expected one claude-opus-4.8 entry, got %d", count)
 	}
 }
 
