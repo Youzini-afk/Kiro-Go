@@ -5,6 +5,44 @@ import (
 	"testing"
 )
 
+func TestParseModelAndThinkingMapsOpus48Aliases(t *testing.T) {
+	tests := []struct {
+		name         string
+		model        string
+		wantModel    string
+		wantThinking bool
+	}{
+		{
+			name:      "dot version",
+			model:     "claude-opus-4.8",
+			wantModel: "claude-opus-4.8",
+		},
+		{
+			name:      "dash version",
+			model:     "claude-opus-4-8",
+			wantModel: "claude-opus-4.8",
+		},
+		{
+			name:         "thinking suffix",
+			model:        "claude-opus-4.8-thinking",
+			wantModel:    "claude-opus-4.8",
+			wantThinking: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			gotModel, gotThinking := ParseModelAndThinking(tc.model, "-thinking")
+			if gotModel != tc.wantModel {
+				t.Fatalf("expected model %q, got %q", tc.wantModel, gotModel)
+			}
+			if gotThinking != tc.wantThinking {
+				t.Fatalf("expected thinking=%v, got %v", tc.wantThinking, gotThinking)
+			}
+		})
+	}
+}
+
 func TestExtractOpenAIMessageTextStructured(t *testing.T) {
 	content := []interface{}{
 		map[string]interface{}{"type": "text", "text": "alpha"},

@@ -47,6 +47,14 @@ func TestNormalizeChunkOverlapDelta(t *testing.T) {
 	}
 }
 
+func TestGetContextWindowSizeTreatsOpus48AsOneMillion(t *testing.T) {
+	for _, model := range []string{"claude-opus-4.8", "claude-opus-4-8"} {
+		if got := getContextWindowSize(model); got != 1_000_000 {
+			t.Fatalf("expected %s to use 1M context window, got %d", model, got)
+		}
+	}
+}
+
 func TestParseEventStreamFinishesPendingToolUseOnEOF(t *testing.T) {
 	stream := bytes.NewReader(awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
 		"toolUseId": "toolu_1",

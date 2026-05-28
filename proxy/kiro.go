@@ -599,9 +599,10 @@ func updateTokensFromEvent(event map[string]interface{}, currentInputTokens, cur
 // getContextWindowSize returns the context window size (in tokens) for a model.
 func getContextWindowSize(model string) int {
 	m := strings.ToLower(model)
-	// sonnet-4.6, opus-4.6, opus-4.7 all have 1M context windows
+	// sonnet-4.6, opus-4.6, opus-4.7, opus-4.8 all have 1M context windows
 	if strings.Contains(m, "4.6") || strings.Contains(m, "4-6") ||
-		strings.Contains(m, "4.7") || strings.Contains(m, "4-7") {
+		strings.Contains(m, "4.7") || strings.Contains(m, "4-7") ||
+		strings.Contains(m, "4.8") || strings.Contains(m, "4-8") {
 		return 1_000_000
 	}
 	return 200_000

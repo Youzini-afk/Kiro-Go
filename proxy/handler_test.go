@@ -480,3 +480,19 @@ func TestBuildAnthropicModelsResponseGeneratesThinkingVariants(t *testing.T) {
 		t.Fatalf("expected image capability to be preserved, got %#v", models[0]["supports_image"])
 	}
 }
+
+func TestFallbackAnthropicModelsIncludesOpus48(t *testing.T) {
+	models := fallbackAnthropicModels("-thinking")
+	ids := make(map[string]bool, len(models))
+	for _, model := range models {
+		id, _ := model["id"].(string)
+		ids[id] = true
+	}
+
+	if !ids["claude-opus-4.8"] {
+		t.Fatalf("expected fallback models to include claude-opus-4.8")
+	}
+	if !ids["claude-opus-4.8-thinking"] {
+		t.Fatalf("expected fallback models to include claude-opus-4.8 thinking variant")
+	}
+}
