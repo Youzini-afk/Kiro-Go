@@ -17,6 +17,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"time"
 )
 
 // GenerateMachineId generates a UUID v4 format machine identifier.
@@ -58,9 +59,22 @@ type Account struct {
 	// Priority weight for load balancing (higher = more requests)
 	Weight int `json:"weight,omitempty"` // 0 or 1 = normal, 2+ = higher priority
 
-	// Overage behavior after the main usage limit is reached.
-	AllowOverage  bool `json:"allowOverage,omitempty"`  // Whether to keep using the account after UsageLimit is reached
-	OverageWeight int  `json:"overageWeight,omitempty"` // 1-10, lower values reduce overage request frequency
+	// Upstream Overages state (mirrored from AWS Q `setUserPreference` / `getUsageLimits`).
+	// OverageStatus is the only switch that decides whether to keep dispatching once UsageLimit is reached.
+	// Allowed values: "ENABLED", "DISABLED", "UNKNOWN" (or empty when not yet fetched).
+	OverageStatus     string  `json:"overageStatus,omitempty"`
+	OverageCapability string  `json:"overageCapability,omitempty"` // "OVERAGE_CAPABLE" / "NOT_OVERAGE_CAPABLE"
+	OverageCap        float64 `json:"overageCap,omitempty"`        // Hard upper bound (USD)
+	OverageRate       float64 `json:"overageRate,omitempty"`       // Per-invocation rate (USD)
+	CurrentOverages   float64 `json:"currentOverages,omitempty"`   // Cumulative overage charges (USD)
+	OverageCheckedAt  int64   `json:"overageCheckedAt,omitempty"`  // Last successful upstream sync (Unix seconds)
+
+	// LegacyAllowOverage is kept for backward-compatible JSON loading only.
+	// Pre-Overages-switch deployments persisted `allowOverage: true` to mean
+	// "keep dispatching when quota is exhausted". On first load we migrate it
+	// into OverageStatus="ENABLED" and zero this field so it does not get
+	// re-emitted on future saves. Do not read this field elsewhere.
+	LegacyAllowOverage bool `json:"allowOverage,omitempty"`
 
 	// Account status
 	Enabled   bool   `json:"enabled"`             // Whether account is active in the pool
@@ -107,18 +121,41 @@ type PromptFilterRule struct {
 	Enabled bool   `json:"enabled"`           // Whether this rule is active
 }
 
+// ApiKeyEntry represents a single API key with optional usage limits and counters.
+// Limits with value 0 are treated as "no limit". Counters are cumulative and never reset
+// automatically; operators can use the admin endpoint to manually reset them.
+type ApiKeyEntry struct {
+	ID         string `json:"id"`                 // Unique identifier (UUID)
+	Name       string `json:"name,omitempty"`     // Human-readable label
+	Key        string `json:"key"`                // The actual key value clients send
+	Enabled    bool   `json:"enabled"`            // Whether this key may authenticate
+	Migrated   bool   `json:"migrated,omitempty"` // True if migrated from legacy single ApiKey field
+	CreatedAt  int64  `json:"createdAt"`          // Creation timestamp (Unix seconds)
+	LastUsedAt int64  `json:"lastUsedAt,omitempty"`
+
+	// Limits (0 = unlimited)
+	TokenLimit  int64   `json:"tokenLimit,omitempty"`
+	CreditLimit float64 `json:"creditLimit,omitempty"`
+
+	// Cumulative usage (never auto-reset)
+	TokensUsed    int64   `json:"tokensUsed,omitempty"`
+	CreditsUsed   float64 `json:"creditsUsed,omitempty"`
+	RequestsCount int64   `json:"requestsCount,omitempty"`
+}
+
 // Config represents the global application configuration.
 type Config struct {
 	// Server settings
-	Password      string    `json:"password"`         // Admin panel password
-	Port          int       `json:"port"`             // HTTP server port (default: 8080)
-	Host          string    `json:"host"`             // HTTP server bind address (default: 0.0.0.0)
-	ApiKey        string    `json:"apiKey,omitempty"` // API key for client authentication
-	RequireApiKey bool      `json:"requireApiKey"`    // Whether to enforce API key validation
-	KiroVersion   string    `json:"kiroVersion,omitempty"`
-	SystemVersion string    `json:"systemVersion,omitempty"`
-	NodeVersion   string    `json:"nodeVersion,omitempty"`
-	Accounts      []Account `json:"accounts"` // Registered Kiro accounts
+	Password      string        `json:"password"`          // Admin panel password
+	Port          int           `json:"port"`              // HTTP server port (default: 8080)
+	Host          string        `json:"host"`              // HTTP server bind address (default: 0.0.0.0)
+	ApiKey        string        `json:"apiKey,omitempty"`  // [Deprecated] Legacy single API key, migrated into ApiKeys on first load
+	RequireApiKey bool          `json:"requireApiKey"`     // [Deprecated] Whether to enforce API key validation; with multi-key support, len(ApiKeys)>0 implicitly enforces auth
+	ApiKeys       []ApiKeyEntry `json:"apiKeys,omitempty"` // Multiple API keys, each with independent quota
+	KiroVersion   string        `json:"kiroVersion,omitempty"`
+	SystemVersion string        `json:"systemVersion,omitempty"`
+	NodeVersion   string        `json:"nodeVersion,omitempty"`
+	Accounts      []Account     `json:"accounts"` // Registered Kiro accounts
 
 	// Thinking mode configuration for extended reasoning output
 	ThinkingSuffix       string `json:"thinkingSuffix,omitempty"`       // Model suffix to trigger thinking mode (default: "-thinking")
@@ -195,7 +232,7 @@ type AccountInfo struct {
 }
 
 // Version current version
-const Version = "1.0.8"
+const Version = "1.1.0"
 
 var (
 	cfg     *Config
@@ -226,7 +263,7 @@ func Load() error {
 				RequireApiKey: false,
 				Accounts:      []Account{},
 			}
-			return Save()
+			return saveLocked()
 		}
 		return err
 	}
@@ -236,7 +273,62 @@ func Load() error {
 		return err
 	}
 	cfg = &c
+
+	// Migration: if a legacy single ApiKey is present and the new ApiKeys list is empty,
+	// promote it into the new structure. The migrated entry inherits the legacy
+	// RequireApiKey state — if the legacy deployment was public (RequireApiKey=false),
+	// we mark the entry disabled so it doesn't accidentally start enforcing auth.
+	// Operators can flip it on later from the admin UI. The legacy field is kept
+	// for backward compatibility when reading older config files.
+	if cfg.ApiKey != "" && len(cfg.ApiKeys) == 0 {
+		cfg.ApiKeys = append(cfg.ApiKeys, ApiKeyEntry{
+			ID:        newUUID(),
+			Name:      "legacy",
+			Key:       cfg.ApiKey,
+			Enabled:   cfg.RequireApiKey,
+			Migrated:  true,
+			CreatedAt: time.Now().Unix(),
+		})
+		if err := saveLocked(); err != nil {
+			return err
+		}
+	}
+
+	// Migration: per-account AllowOverage → OverageStatus.
+	// Pre-Overages-switch deployments stored `allowOverage: true` to mean "keep
+	// dispatching when quota is exhausted". The new model reads OverageStatus
+	// from the upstream AWS Q switch instead. To avoid silently disabling
+	// previously-allowed accounts on first launch, treat allowOverage=true as
+	// OverageStatus="ENABLED" (operators can refresh from AWS later). The
+	// legacy field is then cleared so future saves don't re-emit it.
+	overageMigrated := false
+	for i := range cfg.Accounts {
+		if cfg.Accounts[i].LegacyAllowOverage {
+			if cfg.Accounts[i].OverageStatus == "" {
+				cfg.Accounts[i].OverageStatus = "ENABLED"
+			}
+			cfg.Accounts[i].LegacyAllowOverage = false
+			overageMigrated = true
+		}
+	}
+	if overageMigrated {
+		if err := saveLocked(); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// saveLocked persists cfg to disk. Caller MUST already hold cfgLock.
+// This is identical to Save() (which does not take the lock either) but is named
+// distinctly so call sites that already hold cfgLock are explicit about it.
+func saveLocked() error {
+	return Save()
+}
+
+// newUUID returns a UUID v4 string. Defined here to avoid pulling extra deps in this file.
+func newUUID() string {
+	return GenerateMachineId()
 }
 
 // Save persists the current configuration to the JSON file.
@@ -280,6 +372,47 @@ func SetApiKey(apiKey string, requireApiKey bool) {
 	defer cfgLock.Unlock()
 	cfg.ApiKey = apiKey
 	cfg.RequireApiKey = requireApiKey
+
+	if apiKey == "" {
+		return
+	}
+
+	for i := range cfg.ApiKeys {
+		if cfg.ApiKeys[i].Migrated || cfg.ApiKeys[i].Name == "env" || cfg.ApiKeys[i].Name == "legacy" {
+			cfg.ApiKeys[i].Name = "env"
+			cfg.ApiKeys[i].Key = apiKey
+			cfg.ApiKeys[i].Enabled = requireApiKey
+			cfg.ApiKeys[i].Migrated = true
+			return
+		}
+	}
+
+	cfg.ApiKeys = append(cfg.ApiKeys, ApiKeyEntry{
+		ID:        newUUID(),
+		Name:      "env",
+		Key:       apiKey,
+		Enabled:   requireApiKey,
+		Migrated:  true,
+		CreatedAt: time.Now().Unix(),
+	})
+}
+
+// GetConfigDir returns the directory containing the config JSON file.
+// Useful for sibling state (e.g. stored Responses, caches) that should live
+// alongside the configuration file.
+func GetConfigDir() string {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfgPath == "" {
+		return "."
+	}
+	dir := cfgPath
+	for i := len(dir) - 1; i >= 0; i-- {
+		if dir[i] == '/' || dir[i] == '\\' {
+			return dir[:i]
+		}
+	}
+	return "."
 }
 
 func Get() *Config {
@@ -351,13 +484,63 @@ func UpdateAccount(id string, account Account) error {
 	return nil
 }
 
-// DisableAccountOverage turns off AllowOverage for a specific account.
-func DisableAccountOverage(id string) error {
+// UpdateAccountOverageStatus persists the cached upstream overage status fields.
+// Called after a successful setUserPreference or getUsageLimits round-trip.
+func UpdateAccountOverageStatus(id, status, capability string, cap, rate, current float64, checkedAt int64) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
-			cfg.Accounts[i].AllowOverage = false
+			if status != "" {
+				cfg.Accounts[i].OverageStatus = status
+			}
+			if capability != "" {
+				cfg.Accounts[i].OverageCapability = capability
+			}
+			cfg.Accounts[i].OverageCap = cap
+			cfg.Accounts[i].OverageRate = rate
+			cfg.Accounts[i].CurrentOverages = current
+			if checkedAt > 0 {
+				cfg.Accounts[i].OverageCheckedAt = checkedAt
+			}
+			return Save()
+		}
+	}
+	return nil
+}
+
+// SetAccountEnabled toggles the enabled state of an account and persists the change.
+// Used to disable accounts whose refresh token has been revoked (401 Bad credentials)
+// so subsequent requests skip them automatically.
+func SetAccountEnabled(id string, enabled bool) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i, a := range cfg.Accounts {
+		if a.ID == id {
+			cfg.Accounts[i].Enabled = enabled
+			if !enabled {
+				cfg.Accounts[i].BanStatus = "DISABLED"
+				cfg.Accounts[i].BanTime = time.Now().Unix()
+			}
+			return Save()
+		}
+	}
+	return nil
+}
+
+// SetAccountBanStatus marks an account as banned/disabled with a reason.
+// Reason is recorded so operators can see why the account was auto-disabled.
+func SetAccountBanStatus(id, status, reason string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i, a := range cfg.Accounts {
+		if a.ID == id {
+			cfg.Accounts[i].BanStatus = status
+			cfg.Accounts[i].BanReason = reason
+			cfg.Accounts[i].BanTime = time.Now().Unix()
+			if status == "BANNED" || status == "DISABLED" {
+				cfg.Accounts[i].Enabled = false
+			}
 			return Save()
 		}
 	}
@@ -421,6 +604,21 @@ func UpdateSettings(apiKey string, requireApiKey bool, password string) error {
 	defer cfgLock.Unlock()
 	cfg.ApiKey = apiKey
 	cfg.RequireApiKey = requireApiKey
+	if password != "" {
+		cfg.Password = password
+	}
+	return Save()
+}
+
+func UpdateSettingsPatch(apiKey *string, requireApiKey *bool, password string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if apiKey != nil {
+		cfg.ApiKey = *apiKey
+	}
+	if requireApiKey != nil {
+		cfg.RequireApiKey = *requireApiKey
+	}
 	if password != "" {
 		cfg.Password = password
 	}

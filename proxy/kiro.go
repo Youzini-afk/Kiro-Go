@@ -258,6 +258,19 @@ type KiroStreamCallback struct {
 
 // ==================== API Call ====================
 
+func setPayloadProfileArnForAccount(payload *KiroPayload, account *config.Account) {
+	if payload == nil {
+		return
+	}
+
+	payload.ProfileArn = strings.TrimSpace(payload.ProfileArn)
+	if account != nil {
+		if profileArn := strings.TrimSpace(account.ProfileArn); profileArn != "" {
+			payload.ProfileArn = profileArn
+		}
+	}
+}
+
 // getSortedEndpoints returns endpoints ordered by user preference, with optional fallback.
 func getSortedEndpoints(preferred string) []kiroEndpoint {
 	fallback := config.GetEndpointFallback()
@@ -292,6 +305,15 @@ func getSortedEndpoints(preferred string) []kiroEndpoint {
 
 // CallKiroAPI calls the Kiro streaming API, trying each configured endpoint with automatic fallback.
 func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
+	originalProfileArn := ""
+	if payload != nil {
+		originalProfileArn = payload.ProfileArn
+		defer func() {
+			payload.ProfileArn = originalProfileArn
+		}()
+	}
+	setPayloadProfileArnForAccount(payload, account)
+
 	if _, err := json.Marshal(payload); err != nil {
 		return err
 	}
@@ -400,6 +422,10 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 
 // parseEventStream decodes an AWS binary Event Stream response body.
 func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
+	if callback == nil {
+		callback = &KiroStreamCallback{}
+	}
+
 	// Read directly without bufio to avoid buffering latency in streaming responses.
 	var inputTokens, outputTokens int
 	var totalCredits float64
@@ -477,14 +503,14 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 		case "assistantResponseEvent":
 			if content, ok := event["content"].(string); ok && content != "" {
 				normalized := normalizeChunk(content, &lastAssistantContent)
-				if normalized != "" {
+				if normalized != "" && callback.OnText != nil {
 					callback.OnText(normalized, false)
 				}
 			}
 		case "reasoningContentEvent":
 			if text, ok := event["text"].(string); ok && text != "" {
 				normalized := normalizeChunk(text, &lastReasoningContent)
-				if normalized != "" {
+				if normalized != "" && callback.OnText != nil {
 					callback.OnText(normalized, true)
 				}
 			}
@@ -503,11 +529,17 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 		}
 	}
 
+	if currentToolUse != nil {
+		finishToolUse(currentToolUse, callback)
+	}
+
 	if callback.OnCredits != nil && totalCredits > 0 {
 		callback.OnCredits(totalCredits)
 	}
 
-	callback.OnComplete(inputTokens, outputTokens)
+	if callback.OnComplete != nil {
+		callback.OnComplete(inputTokens, outputTokens)
+	}
 	return nil
 }
 
@@ -674,20 +706,31 @@ type toolUseState struct {
 	ToolUseID   string
 	Name        string
 	InputBuffer strings.Builder
+	GeneratedID bool
 }
 
 func handleToolUseEvent(event map[string]interface{}, current *toolUseState, callback *KiroStreamCallback) *toolUseState {
-	toolUseID, _ := event["toolUseId"].(string)
-	name, _ := event["name"].(string)
-	isStop, _ := event["stop"].(bool)
+	toolUseID := firstStringField(event, "toolUseId", "toolUseID", "tool_use_id", "id")
+	name := firstStringField(event, "name", "toolName", "tool_name")
+	isStop := firstBoolField(event, "stop", "isStop", "done")
 
 	if toolUseID != "" && name != "" {
 		if current == nil {
 			current = &toolUseState{ToolUseID: toolUseID, Name: name}
 		} else if current.ToolUseID != toolUseID {
-			finishToolUse(current, callback)
-			current = &toolUseState{ToolUseID: toolUseID, Name: name}
+			if current.GeneratedID && current.Name == name {
+				current.ToolUseID = toolUseID
+				current.GeneratedID = false
+			} else {
+				finishToolUse(current, callback)
+				current = &toolUseState{ToolUseID: toolUseID, Name: name}
+			}
 		}
+	} else if name != "" && current == nil {
+		current = &toolUseState{ToolUseID: "toolu_" + uuid.New().String(), Name: name, GeneratedID: true}
+	} else if name != "" && current != nil && current.Name != name {
+		finishToolUse(current, callback)
+		current = &toolUseState{ToolUseID: "toolu_" + uuid.New().String(), Name: name, GeneratedID: true}
 	}
 
 	if current != nil {
@@ -709,6 +752,12 @@ func handleToolUseEvent(event map[string]interface{}, current *toolUseState, cal
 }
 
 func finishToolUse(state *toolUseState, callback *KiroStreamCallback) {
+	if state == nil || state.Name == "" || callback == nil || callback.OnToolUse == nil {
+		return
+	}
+	if state.ToolUseID == "" {
+		state.ToolUseID = "toolu_" + uuid.New().String()
+	}
 	var input map[string]interface{}
 	if state.InputBuffer.Len() > 0 {
 		json.Unmarshal([]byte(state.InputBuffer.String()), &input)
@@ -721,6 +770,24 @@ func finishToolUse(state *toolUseState, callback *KiroStreamCallback) {
 		Name:      state.Name,
 		Input:     input,
 	})
+}
+
+func firstStringField(m map[string]interface{}, keys ...string) string {
+	for _, key := range keys {
+		if v, ok := m[key].(string); ok && v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func firstBoolField(m map[string]interface{}, keys ...string) bool {
+	for _, key := range keys {
+		if v, ok := m[key].(bool); ok {
+			return v
+		}
+	}
+	return false
 }
 
 // eventStreamHeaders holds parsed AWS Event Stream message header values.
